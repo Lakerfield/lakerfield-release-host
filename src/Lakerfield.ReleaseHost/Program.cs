@@ -30,7 +30,9 @@ app.Use(async (context, next) =>
   var isS3Auth = authHeader.StartsWith("AWS4-HMAC-SHA256 ", StringComparison.OrdinalIgnoreCase);
 
   if (isS3Auth &&
-      (context.Request.Method == HttpMethods.Put || context.Request.Method == HttpMethods.Head))
+      (context.Request.Method == HttpMethods.Get ||
+       context.Request.Method == HttpMethods.Put ||
+       context.Request.Method == HttpMethods.Head))
   {
     if (s3Settings is null)
     {
@@ -327,7 +329,9 @@ static async Task HandleS3RequestAsync(
 
   var path = context.Request.Path.Value ?? "/";
 
-  if (context.Request.Method == HttpMethods.Put)
+  if (context.Request.Method == HttpMethods.Get)
+    await HandleS3GetObjectAsync(context, path, settings, cancellationToken);
+  else if (context.Request.Method == HttpMethods.Put)
     await HandleS3PutObjectAsync(context, path, settings, cancellationToken);
   else
     await HandleS3HeadObjectAsync(context, path, settings);
@@ -413,6 +417,63 @@ static async Task HandleS3PutObjectAsync(
   context.Response.Headers.ETag = etag;
   context.Response.ContentLength = 0;
   await context.Response.CompleteAsync();
+}
+
+static async Task HandleS3GetObjectAsync(
+    HttpContext context,
+    string path,
+    FileServerSettings settings,
+    CancellationToken cancellationToken)
+{
+  var relativePath = SanitizeRelativeUploadPath(path.TrimStart('/'));
+  if (string.IsNullOrWhiteSpace(relativePath))
+  {
+    await WriteS3ErrorAsync(context, 400, "InvalidArgument", "Invalid object key");
+    return;
+  }
+
+  var targetPath = Path.Combine(settings.StorageRoot, relativePath);
+  var fullStorageRoot = Path.GetFullPath(settings.StorageRoot);
+  var fullTargetPath = Path.GetFullPath(targetPath);
+  if (!fullTargetPath.StartsWith(fullStorageRoot, StringComparison.Ordinal))
+  {
+    await WriteS3ErrorAsync(context, 404, "NoSuchKey", "The specified key does not exist");
+    return;
+  }
+
+  var fileInfo = new FileInfo(fullTargetPath);
+  if (!fileInfo.Exists)
+  {
+    await WriteS3ErrorAsync(context, 404, "NoSuchKey", "The specified key does not exist");
+    return;
+  }
+
+  var etagSource = $"{fileInfo.Length}-{fileInfo.LastWriteTimeUtc.Ticks}";
+  var etagHash = Convert.ToHexString(SHA256.HashData(
+      Encoding.UTF8.GetBytes(etagSource))).ToLowerInvariant()[..16];
+
+  context.Response.StatusCode = 200;
+  context.Response.Headers.ETag = $"\"{etagHash}\"";
+  context.Response.ContentLength = fileInfo.Length;
+  context.Response.ContentType = "application/octet-stream";
+  context.Response.Headers["Last-Modified"] = fileInfo.LastWriteTimeUtc.ToString("R");
+
+  try
+  {
+    await using var fs = new FileStream(fullTargetPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+        bufferSize: 64 * 1024, useAsync: true);
+    await fs.CopyToAsync(context.Response.Body, cancellationToken);
+  }
+  catch (OperationCanceledException)
+  {
+    // Client disconnected – nothing to do.
+  }
+  catch (Exception)
+  {
+    // File may have been deleted or locked after the existence check; the response
+    // headers are already sent so we can only abort the connection at this point.
+    context.Abort();
+  }
 }
 
 static async Task HandleS3HeadObjectAsync(
