@@ -5,6 +5,11 @@ using Microsoft.Extensions.FileProviders;
 
 var builder = WebApplication.CreateBuilder(args);
 
+builder.WebHost.ConfigureKestrel(options =>
+{
+  options.Limits.MaxRequestBodySize = 100 * 1024 * 1024; // 100 MB
+});
+
 var settings = new FileServerSettings
 {
   UploadToken = builder.Configuration["Upload:Token"] ?? throw new InvalidOperationException("Upload:Token missing"),
