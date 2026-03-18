@@ -368,6 +368,13 @@ static async Task HandleS3PutObjectAsync(
   if (hasPayloadHash)
     context.Request.Headers["X-Checksum-Sha256"] = xAmzSha256;
 
+  // When the client uses streaming signatures the body uses AWS chunked encoding.
+  // Wrap the request body so that only the actual payload bytes are written to disk.
+  var isAwsChunked = xAmzSha256 is not null &&
+      xAmzSha256.StartsWith("STREAMING-", StringComparison.OrdinalIgnoreCase);
+  if (isAwsChunked)
+    context.Request.Body = new AwsChunkedDecodingStream(context.Request.Body);
+
   var s3ChecksumSettings = new FileServerSettings
   {
     UploadToken = settings.UploadToken,
@@ -697,4 +704,150 @@ public sealed class S3Settings
 {
   public required string AccessKey { get; init; }
   public required string SecretKey { get; init; }
+}
+
+// Decodes the AWS chunked transfer encoding used when x-amz-content-sha256 is
+// STREAMING-AWS4-HMAC-SHA256-PAYLOAD (or similar STREAMING-* values).
+//
+// Each chunk in the wire format looks like:
+//   {hex-size}[;chunk-extension]\r\n
+//   {data-bytes}\r\n
+// The stream ends with a zero-length chunk:
+//   0[;chunk-extension]\r\n
+//   [optional trailers]
+internal sealed class AwsChunkedDecodingStream : Stream
+{
+  private readonly Stream _inner;
+  private readonly byte[] _readBuf = new byte[4096];
+  private int _readBufPos;
+  private int _readBufLen;
+  private long _chunkBytesRemaining;
+  private bool _needChunkHeader = true;
+  private bool _finished;
+
+  public AwsChunkedDecodingStream(Stream inner) => _inner = inner;
+
+  public override bool CanRead => true;
+  public override bool CanSeek => false;
+  public override bool CanWrite => false;
+  public override long Length => throw new NotSupportedException();
+  public override long Position
+  {
+    get => throw new NotSupportedException();
+    set => throw new NotSupportedException();
+  }
+
+  public override void Flush() { }
+  public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+  public override void SetLength(long value) => throw new NotSupportedException();
+  public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+  public override int Read(byte[] buffer, int offset, int count) =>
+      ReadAsync(buffer.AsMemory(offset, count), CancellationToken.None).AsTask().GetAwaiter().GetResult();
+
+  public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+  {
+    if (_finished || buffer.IsEmpty) return 0;
+
+    while (true)
+    {
+      if (_needChunkHeader)
+      {
+        var line = await ReadLineAsync(cancellationToken);
+        if (line is null) { _finished = true; return 0; }
+
+        // Strip optional chunk extensions: "{hex-size};chunk-signature=..."
+        var semiIdx = line.IndexOf(';');
+        var hexPart = semiIdx >= 0 ? line.AsSpan(0, semiIdx) : line.AsSpan();
+
+        if (!long.TryParse(hexPart, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var chunkSize)
+            || chunkSize < 0)
+          throw new IOException($"Invalid chunk size in AWS chunked encoding: '{hexPart.ToString()}'");
+
+        if (chunkSize == 0)
+        {
+          _finished = true;
+          return 0;
+        }
+
+        _chunkBytesRemaining = chunkSize;
+        _needChunkHeader = false;
+      }
+
+      if (_chunkBytesRemaining > 0)
+      {
+        var toRead = (int)Math.Min(buffer.Length, _chunkBytesRemaining);
+        var read = await ReadFromBufferAsync(buffer[..toRead], cancellationToken);
+        if (read == 0)
+          throw new IOException("Unexpected end of stream inside an AWS chunked encoding chunk");
+
+        _chunkBytesRemaining -= read;
+
+        if (_chunkBytesRemaining == 0)
+        {
+          // Consume the trailing \r\n that follows each chunk's data.
+          await ReadLineAsync(cancellationToken);
+          _needChunkHeader = true;
+        }
+
+        return read;
+      }
+    }
+  }
+
+  // Reads up to dst.Length bytes from the internal read buffer, refilling from
+  // the inner stream when needed. Returns 0 only on EOF.
+  private async ValueTask<int> ReadFromBufferAsync(Memory<byte> dst, CancellationToken ct)
+  {
+    if (_readBufPos >= _readBufLen)
+    {
+      _readBufLen = await _inner.ReadAsync(_readBuf, ct);
+      _readBufPos = 0;
+      if (_readBufLen == 0) return 0;
+    }
+
+    var available = Math.Min(dst.Length, _readBufLen - _readBufPos);
+    _readBuf.AsMemory(_readBufPos, available).CopyTo(dst);
+    _readBufPos += available;
+    return available;
+  }
+
+  // Reads one byte from the internal buffer, refilling from the inner stream
+  // when needed. Returns -1 on EOF.
+  private async ValueTask<int> ReadByteFromBufferAsync(CancellationToken ct)
+  {
+    if (_readBufPos >= _readBufLen)
+    {
+      _readBufLen = await _inner.ReadAsync(_readBuf, ct);
+      _readBufPos = 0;
+      if (_readBufLen == 0) return -1;
+    }
+
+    return _readBuf[_readBufPos++];
+  }
+
+  // Reads bytes from the internal buffer until '\n', returning the line without
+  // the line ending. Returns null when the stream ends before any bytes are read.
+  private async Task<string?> ReadLineAsync(CancellationToken ct)
+  {
+    var bytes = new List<byte>(64);
+
+    while (true)
+    {
+      var b = await ReadByteFromBufferAsync(ct);
+      if (b == -1)
+        return bytes.Count == 0 ? null : Encoding.ASCII.GetString([.. bytes]).TrimEnd('\r');
+
+      if (b == '\n')
+        return Encoding.ASCII.GetString([.. bytes]).TrimEnd('\r');
+
+      bytes.Add((byte)b);
+    }
+  }
+
+  protected override void Dispose(bool disposing)
+  {
+    // Intentionally do not dispose the inner stream – it is owned by the request pipeline.
+    base.Dispose(disposing);
+  }
 }
