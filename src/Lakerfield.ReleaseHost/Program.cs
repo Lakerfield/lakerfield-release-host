@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using Microsoft.Extensions.FileProviders;
@@ -12,9 +13,37 @@ var settings = new FileServerSettings
   VerifyChecksum = !bool.TryParse(builder.Configuration["Upload:VerifyChecksum"], out var verifyChecksum) || verifyChecksum
 };
 
+S3Settings? s3Settings = null;
+var s3AccessKey = builder.Configuration["S3:AccessKey"];
+var s3SecretKey = builder.Configuration["S3:SecretKey"];
+if (!string.IsNullOrEmpty(s3AccessKey) && !string.IsNullOrEmpty(s3SecretKey))
+  s3Settings = new S3Settings { AccessKey = s3AccessKey, SecretKey = s3SecretKey };
+
 var app = builder.Build();
 
 Directory.CreateDirectory(settings.StorageRoot);
+
+// S3-compatible API middleware — intercepts PUT/HEAD requests that carry AWS Signature V4 auth.
+app.Use(async (context, next) =>
+{
+  var authHeader = context.Request.Headers.Authorization.ToString();
+  var isS3Auth = authHeader.StartsWith("AWS4-HMAC-SHA256 ", StringComparison.OrdinalIgnoreCase);
+
+  if (isS3Auth &&
+      (context.Request.Method == HttpMethods.Put || context.Request.Method == HttpMethods.Head))
+  {
+    if (s3Settings is null)
+    {
+      await WriteS3ErrorAsync(context, 403, "AccessDenied", "S3 API is not configured on this server");
+      return;
+    }
+
+    await HandleS3RequestAsync(context, s3Settings, settings, context.RequestAborted);
+    return;
+  }
+
+  await next();
+});
 
 app.Use(async (context, next) =>
 {
@@ -77,7 +106,8 @@ app.MapGet("/health", () => Results.Ok(new
 {
   status = "ok",
   checksumVerification = settings.VerifyChecksum,
-  checksumRequired = settings.RequireChecksum
+  checksumRequired = settings.RequireChecksum,
+  s3Compatible = s3Settings is not null
 }));
 
 app.UseDefaultFiles(new DefaultFilesOptions
@@ -257,6 +287,336 @@ static void TryDelete(string path)
   }
 }
 
+// ── S3-compatible API ─────────────────────────────────────────────────────────
+
+static async Task HandleS3RequestAsync(
+    HttpContext context,
+    S3Settings s3Settings,
+    FileServerSettings settings,
+    CancellationToken cancellationToken)
+{
+  var authHeader = context.Request.Headers.Authorization.ToString();
+  var (accessKeyId, date, region, service, signedHeaderNames, signature) =
+      ParseAwsAuthHeader(authHeader);
+
+  if (!SecureEquals(accessKeyId, s3Settings.AccessKey))
+  {
+    await WriteS3ErrorAsync(context, 403, "InvalidAccessKeyId",
+        "The AWS Access Key Id provided does not exist in our records");
+    return;
+  }
+
+  var amzDate = context.Request.Headers["x-amz-date"].FirstOrDefault();
+  if (!TryParseAmzDate(amzDate, out var requestDate) ||
+      Math.Abs((DateTime.UtcNow - requestDate).TotalMinutes) > 15)
+  {
+    await WriteS3ErrorAsync(context, 403, "RequestExpired",
+        "The difference between the request time and the current time is too large");
+    return;
+  }
+
+  var expectedSig = ComputeAwsV4Signature(
+      context.Request, s3Settings.SecretKey, date, region, service, signedHeaderNames);
+
+  if (!SecureEquals(signature, expectedSig))
+  {
+    await WriteS3ErrorAsync(context, 403, "SignatureDoesNotMatch",
+        "The request signature we calculated does not match the signature you provided");
+    return;
+  }
+
+  var path = context.Request.Path.Value ?? "/";
+
+  if (context.Request.Method == HttpMethods.Put)
+    await HandleS3PutObjectAsync(context, path, settings, cancellationToken);
+  else
+    await HandleS3HeadObjectAsync(context, path, settings);
+}
+
+static async Task HandleS3PutObjectAsync(
+    HttpContext context,
+    string path,
+    FileServerSettings settings,
+    CancellationToken cancellationToken)
+{
+  var relativePath = SanitizeRelativeUploadPath(path.TrimStart('/'));
+  if (string.IsNullOrWhiteSpace(relativePath))
+  {
+    await WriteS3ErrorAsync(context, 400, "InvalidArgument", "Invalid object key");
+    return;
+  }
+
+  var targetPath = Path.Combine(settings.StorageRoot, relativePath);
+  var fullStorageRoot = Path.GetFullPath(settings.StorageRoot);
+  var fullTargetPath = Path.GetFullPath(targetPath);
+  if (!fullTargetPath.StartsWith(fullStorageRoot, StringComparison.Ordinal))
+  {
+    await WriteS3ErrorAsync(context, 400, "InvalidArgument", "Invalid object key");
+    return;
+  }
+
+  var fileName = Path.GetFileName(fullTargetPath);
+  if (string.IsNullOrWhiteSpace(fileName))
+  {
+    await WriteS3ErrorAsync(context, 400, "InvalidArgument", "Invalid object key: missing file name");
+    return;
+  }
+
+  // Map x-amz-content-sha256 to X-Checksum-Sha256 when it carries a real hash.
+  var xAmzSha256 = context.Request.Headers["x-amz-content-sha256"].FirstOrDefault();
+  var hasPayloadHash = IsValidSha256Hex(xAmzSha256);
+  if (hasPayloadHash)
+    context.Request.Headers["X-Checksum-Sha256"] = xAmzSha256;
+
+  var s3ChecksumSettings = new FileServerSettings
+  {
+    UploadToken = settings.UploadToken,
+    StorageRoot = settings.StorageRoot,
+    VerifyChecksum = hasPayloadHash && settings.VerifyChecksum,
+    RequireChecksum = false
+  };
+
+  var result = await SaveRequestBodyToFileAsync(
+      context.Request, fullTargetPath, s3ChecksumSettings, cancellationToken);
+
+  if (!result.Success)
+  {
+    if (result.StatusCode == StatusCodes.Status400BadRequest &&
+        string.Equals(result.Message, "Checksum mismatch", StringComparison.Ordinal))
+    {
+      await WriteS3ErrorAsync(context, 400, "InvalidDigest",
+          "The content SHA256 you specified did not match what the server received");
+    }
+    else if (result.StatusCode == StatusCodes.Status499ClientClosedRequest)
+    {
+      context.Response.StatusCode = 499;
+    }
+    else
+    {
+      await WriteS3ErrorAsync(context, result.StatusCode, "InternalError", result.Message);
+    }
+    return;
+  }
+
+  var etag = result.Sha256 is not null
+      ? $"\"{result.Sha256}\""
+      : $"\"{Guid.NewGuid():N}\"";
+
+  context.Response.StatusCode = 200;
+  context.Response.Headers.ETag = etag;
+  context.Response.ContentLength = 0;
+  await context.Response.CompleteAsync();
+}
+
+static async Task HandleS3HeadObjectAsync(
+    HttpContext context,
+    string path,
+    FileServerSettings settings)
+{
+  var relativePath = SanitizeRelativeUploadPath(path.TrimStart('/'));
+  if (string.IsNullOrWhiteSpace(relativePath))
+  {
+    context.Response.StatusCode = 400;
+    return;
+  }
+
+  var targetPath = Path.Combine(settings.StorageRoot, relativePath);
+  var fullStorageRoot = Path.GetFullPath(settings.StorageRoot);
+  var fullTargetPath = Path.GetFullPath(targetPath);
+  if (!fullTargetPath.StartsWith(fullStorageRoot, StringComparison.Ordinal))
+  {
+    context.Response.StatusCode = 404;
+    return;
+  }
+
+  var fileInfo = new FileInfo(fullTargetPath);
+  if (!fileInfo.Exists)
+  {
+    context.Response.StatusCode = 404;
+    return;
+  }
+
+  var etagSource = $"{fileInfo.Length}-{fileInfo.LastWriteTimeUtc.Ticks}";
+  var etagHash = Convert.ToHexString(SHA256.HashData(
+      Encoding.UTF8.GetBytes(etagSource))).ToLowerInvariant()[..16];
+
+  context.Response.StatusCode = 200;
+  context.Response.Headers.ETag = $"\"{etagHash}\"";
+  context.Response.ContentLength = fileInfo.Length;
+  context.Response.ContentType = "application/octet-stream";
+  context.Response.Headers["Last-Modified"] = fileInfo.LastWriteTimeUtc.ToString("R");
+  await context.Response.CompleteAsync();
+}
+
+// ── AWS Signature V4 helpers ──────────────────────────────────────────────────
+
+static (string AccessKeyId, string Date, string Region, string Service,
+        string[] SignedHeaders, string Signature)
+    ParseAwsAuthHeader(string authHeader)
+{
+  // AWS4-HMAC-SHA256 Credential=KEY/DATE/REGION/SERVICE/aws4_request,
+  //                  SignedHeaders=header1;header2,
+  //                  Signature=hexsig
+  var body = authHeader["AWS4-HMAC-SHA256 ".Length..];
+  var parts = body.Split(',', StringSplitOptions.TrimEntries);
+
+  string accessKeyId = "", date = "", region = "", service = "",
+         signedHeaders = "", signature = "";
+
+  foreach (var part in parts)
+  {
+    if (part.StartsWith("Credential=", StringComparison.Ordinal))
+    {
+      var cred = part["Credential=".Length..].Split('/');
+      if (cred.Length >= 4)
+      {
+        accessKeyId = cred[0];
+        date = cred[1];
+        region = cred[2];
+        service = cred[3];
+      }
+    }
+    else if (part.StartsWith("SignedHeaders=", StringComparison.Ordinal))
+      signedHeaders = part["SignedHeaders=".Length..];
+    else if (part.StartsWith("Signature=", StringComparison.Ordinal))
+      signature = part["Signature=".Length..];
+  }
+
+  return (accessKeyId, date, region, service,
+          signedHeaders.Split(';', StringSplitOptions.RemoveEmptyEntries),
+          signature);
+}
+
+static string ComputeAwsV4Signature(
+    HttpRequest request,
+    string secretKey,
+    string date,
+    string region,
+    string service,
+    string[] signedHeaderNames)
+{
+  var method = request.Method.ToUpperInvariant();
+  var canonicalUri = CanonicalizeS3Uri(request.Path.Value ?? "/");
+  var canonicalQuery = CanonicalizeAwsQueryString(request.Query);
+  var sortedHeaders = signedHeaderNames
+      .Select(h => h.ToLowerInvariant())
+      .OrderBy(h => h, StringComparer.Ordinal)
+      .ToArray();
+  var canonicalHeaders = BuildAwsCanonicalHeaders(request, sortedHeaders);
+  var signedHeadersStr = string.Join(";", sortedHeaders);
+  var payloadHash = request.Headers["x-amz-content-sha256"].FirstOrDefault()
+                    ?? "UNSIGNED-PAYLOAD";
+
+  // Step 1 – canonical request
+  // CanonicalHeaders already ends with '\n'; the spec requires one more '\n'
+  // (blank line) before the SignedHeaders line.
+  var canonicalRequest =
+      $"{method}\n{canonicalUri}\n{canonicalQuery}\n{canonicalHeaders}\n{signedHeadersStr}\n{payloadHash}";
+
+  // Step 2 – string to sign
+  var dateTime = request.Headers["x-amz-date"].FirstOrDefault() ?? "";
+  var credScope = $"{date}/{region}/{service}/aws4_request";
+  var crHash = Sha256Hex(Encoding.UTF8.GetBytes(canonicalRequest));
+  var stringToSign = $"AWS4-HMAC-SHA256\n{dateTime}\n{credScope}\n{crHash}";
+
+  // Step 3 – signing key
+  var kDate = HmacSha256(Encoding.UTF8.GetBytes("AWS4" + secretKey), date);
+  var kRegion = HmacSha256(kDate, region);
+  var kService = HmacSha256(kRegion, service);
+  var kSigning = HmacSha256(kService, "aws4_request");
+
+  // Step 4 – signature
+  return Convert.ToHexString(HmacSha256(kSigning, stringToSign)).ToLowerInvariant();
+}
+
+static string CanonicalizeS3Uri(string path)
+{
+  if (string.IsNullOrEmpty(path)) return "/";
+  // Encode each segment individually; preserve '/' separators.
+  var segments = path.Split('/');
+  return string.Join("/", segments.Select(s => AwsUriEncode(s)));
+}
+
+static string CanonicalizeAwsQueryString(IQueryCollection query)
+{
+  if (!query.Any()) return "";
+  return string.Join("&",
+      query
+          .SelectMany(p => p.Value.Select(v =>
+              (Key: AwsUriEncode(p.Key), Val: AwsUriEncode(v ?? ""))))
+          .OrderBy(p => p.Key, StringComparer.Ordinal)
+          .Select(p => $"{p.Key}={p.Val}"));
+}
+
+static string BuildAwsCanonicalHeaders(HttpRequest request, IEnumerable<string> sortedLowerNames)
+{
+  var sb = new StringBuilder();
+  foreach (var name in sortedLowerNames)
+  {
+    var value = name == "host"
+        ? request.Host.Value ?? ""
+        : request.Headers[name].ToString();
+
+    // Trim and collapse runs of whitespace to a single space.
+    value = string.Join(" ",
+        value.Trim().Split(new[] { ' ', '\t', '\r', '\n' },
+            StringSplitOptions.RemoveEmptyEntries));
+
+    sb.Append(name).Append(':').Append(value).Append('\n');
+  }
+  return sb.ToString();
+}
+
+static string AwsUriEncode(string value)
+{
+  // Percent-encode every byte that is not an RFC 3986 unreserved character.
+  var sb = new StringBuilder();
+  foreach (var b in Encoding.UTF8.GetBytes(value))
+  {
+    if ((b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') ||
+        b == '-' || b == '_' || b == '.' || b == '~')
+      sb.Append((char)b);
+    else
+      sb.Append($"%{b:X2}");
+  }
+  return sb.ToString();
+}
+
+static bool TryParseAmzDate(string? amzDate, out DateTime result)
+{
+  result = default;
+  if (string.IsNullOrEmpty(amzDate)) return false;
+  return DateTime.TryParseExact(
+      amzDate, "yyyyMMdd'T'HHmmss'Z'",
+      CultureInfo.InvariantCulture,
+      DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+      out result);
+}
+
+static string Sha256Hex(byte[] data) =>
+    Convert.ToHexString(SHA256.HashData(data)).ToLowerInvariant();
+
+static byte[] HmacSha256(byte[] key, string data) =>
+    HMACSHA256.HashData(key, Encoding.UTF8.GetBytes(data));
+
+static Task WriteS3ErrorAsync(HttpContext context, int statusCode, string code, string message)
+{
+  context.Response.StatusCode = statusCode;
+  context.Response.ContentType = "application/xml";
+  return context.Response.WriteAsync(
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+      $"<Error><Code>{XmlEncode(code)}</Code>" +
+      $"<Message>{XmlEncode(message)}</Message></Error>");
+}
+
+static string XmlEncode(string value) =>
+    value
+        .Replace("&", "&amp;")
+        .Replace("<", "&lt;")
+        .Replace(">", "&gt;")
+        .Replace("\"", "&quot;")
+        .Replace("'", "&apos;");
+
 public sealed class FileServerSettings
 {
   public required string UploadToken { get; init; }
@@ -331,4 +691,10 @@ public sealed class FileSaveResult
         detail: Message,
         statusCode: StatusCode);
   }
+}
+
+public sealed class S3Settings
+{
+  public required string AccessKey { get; init; }
+  public required string SecretKey { get; init; }
 }
