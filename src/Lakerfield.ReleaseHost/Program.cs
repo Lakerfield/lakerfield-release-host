@@ -196,6 +196,7 @@ static async Task<FileSaveResult> SaveRequestBodyToFileAsync(
     }
 
     fileStream.Flush(flushToDisk: true);
+    fileStream.Close();
 
     if (!string.IsNullOrWhiteSpace(expectedChecksum) &&
         settings.VerifyChecksum &&
