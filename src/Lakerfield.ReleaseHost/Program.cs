@@ -459,7 +459,7 @@ static async Task HandleS3GetObjectAsync(
       Encoding.UTF8.GetBytes(etagSource))).ToLowerInvariant()[..16];
 
   context.Response.StatusCode = 200;
-  context.Response.Headers.ETag = $"\"{etagHash}\"";
+  context.Response.Headers.ETag = $"\"{etagHash}-1\"";
   context.Response.ContentLength = fileInfo.Length;
   context.Response.ContentType = "application/octet-stream";
   context.Response.Headers["Last-Modified"] = fileInfo.LastWriteTimeUtc.ToString("R");
@@ -515,7 +515,7 @@ static async Task HandleS3HeadObjectAsync(
       Encoding.UTF8.GetBytes(etagSource))).ToLowerInvariant()[..16];
 
   context.Response.StatusCode = 200;
-  context.Response.Headers.ETag = $"\"{etagHash}\"";
+  context.Response.Headers.ETag = $"\"{etagHash}-1\"";
   context.Response.ContentLength = fileInfo.Length;
   context.Response.ContentType = "application/octet-stream";
   context.Response.Headers["Last-Modified"] = fileInfo.LastWriteTimeUtc.ToString("R");
