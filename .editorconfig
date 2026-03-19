@@ -1,0 +1,16 @@
+root = true
+
+[*]
+indent_style = space
+indent_size = 2
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+[*.cs]
+indent_style = space
+indent_size = 2
+csharp_preferred_quote_style = Double
+csharp_placement_of_accessor_modifier_keywords = place_on_own_line_when_broken
+csharp_preserve_single_line_statements = true
