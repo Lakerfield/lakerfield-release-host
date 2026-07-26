@@ -1,27 +1,61 @@
 # Lakerfield.ReleaseHost
 
-A small .NET 10 file hosting service for application releases and static download pages. No database or cloud storage required.
+A small .NET 10 file hosting service for multi-scope application releases and static download pages.
+No database or cloud storage required.
 
-- Upload files from CI/CD pipelines protected by a bearer token **or AWS Signature V4**
-- Serve release artifacts such as Velopack packages
+- **S3-compatible API** (primary) — Velopack and other S3 clients upload directly using per-scope credentials
+- **Bearer-token upload** for root static assets (index page, CSS, images)
+- Serve release artifacts such as Velopack packages on a per-scope/bucket basis
 - Host a root `index.html` with installation instructions or download links
 - Optional SHA-256 checksum verification and atomic file writes
 
 ## Quick start
 
+1. Mount a volume, create `config.json` inside it with your scopes and keys.
+2. Run the container — no extra environment variables required for S3 uploads.
+
 ```bash
 docker run -d \
   --name lakerfield-releasehost \
   -p 80:80 \
-  -e Upload__Token="change-me" \
-  -v ./data:/data/files \
+  -v ./data:/data \
   ghcr.io/lakerfield/release-host:latest
 ```
 
-- `http://localhost/` — root page
-- `http://localhost/upload/...` — bearer-token upload endpoint
-- `http://localhost/...` — S3-compatible upload / download endpoint
-- `http://localhost/health` — health check
+- `http://localhost/` — root page (`index.html` from files directory, or 404)
+- `http://localhost/{bucket}/{*key}` — S3-compatible upload / download endpoint
+- `http://localhost/{*relativePath}` — bearer-token PUT for root static assets
+- `http://localhost/health` — health check (reports configured scopes)
+
+## Storage config (`config.json`)
+
+Create `config.json` at the root of the mounted storage volume (e.g. `/data/config.json`).
+The file is loaded at startup and controls all upload credentials.
+It is stored outside the files-serving directory (`/data/files/`) and is never served publicly.
+
+```json
+{
+  "rootUploadKey": "root-secret",
+  "scopes": {
+    "ui": {
+      "s3AccessKey": "ui-access-key",
+      "s3SecretKey": "ui-secret-key"
+    },
+    "service": {
+      "s3AccessKey": "service-access-key",
+      "s3SecretKey": "service-secret-key"
+    }
+  }
+}
+```
+
+| Field | Description |
+|---|---|
+| `rootUploadKey` | ****** for root static asset uploads via `/upload/...` |
+| `scopes.<name>.s3AccessKey` | S3 access key ID for this bucket/scope |
+| `scopes.<name>.s3SecretKey` | S3 secret access key for this bucket/scope |
+
+> **Tip:** Each product or application component becomes its own scope (bucket). Add as many scopes as needed.
 
 ## Docker Compose
 
@@ -33,69 +67,41 @@ services:
     restart: unless-stopped
     ports:
       - "80:80"
-    environment:
-      Upload__Token: "change-me"
     volumes:
-      - ./data:/data/files
+      - ./data:/data
 ```
 
-## Upload example (bearer token)
+Then place your `config.json` in `./data/config.json` before starting the container.
 
-```bash
-FILE="MyApp-1.2.3-full.nupkg"
-SHA=$(sha256sum "$FILE" | awk '{print $1}')
+## S3-compatible upload (primary — for Velopack and CI)
 
-curl --fail-with-body -X PUT \
-  -H "Authorization: Bearer $UPLOAD_TOKEN" \
-  -H "Content-Type: application/octet-stream" \
-  -H "X-Checksum-Sha256: $SHA" \
-  --data-binary "@$FILE" \
-  "https://releases.example.com/upload/stable/$FILE"
-```
+The service accepts standard S3 PUT/GET/HEAD requests authenticated with **AWS Signature Version 4**.
+The bucket name is the release scope (e.g. `ui`, `service`).
+Credentials are loaded from `config.json` in the storage root — one access/secret key pair per scope.
 
-## S3-compatible upload
+### Behaviour
 
-When `S3:AccessKey` and `S3:SecretKey` are configured the service accepts
-standard S3 `PUT` and `HEAD` requests authenticated with **AWS Signature
-Version 4**.  Files are stored under the same `Storage:Root` as bearer-token
-uploads — the bucket name becomes the first directory level.
-
-### Configuration
-
-| Setting | Environment variable | Default | Description |
+| Operation | Path | Auth | Description |
 |---|---|---|---|
-| `Upload:Token` | `Upload__Token` | none | Bearer token required for uploads |
-| `Upload:VerifyChecksum` | `Upload__VerifyChecksum` | `true` | Verifies `X-Checksum-Sha256` / `x-amz-content-sha256` when present |
-| `Upload:RequireChecksum` | `Upload__RequireChecksum` | `false` | Rejects uploads when checksum header is missing |
-| `Storage:Root` | `Storage__Root` | `/data/files` | Root folder used for hosted files |
-| `S3:AccessKey` | `S3__AccessKey` | _(disabled)_ | S3 access key ID — enables S3 API when set together with `S3:SecretKey` |
-| `S3:SecretKey` | `S3__SecretKey` | _(disabled)_ | S3 secret access key — enables S3 API when set together with `S3:AccessKey` |
+| `PUT /{bucket}/{*key}` | e.g. `/ui/releases.stable.json` | SigV4 with scope credentials | Upload object |
+| `HEAD /{bucket}/{*key}` | e.g. `/ui/MyApp-1.2.3-full.nupkg` | SigV4 with scope credentials | Check existence / metadata |
+| `GET /{bucket}/{*key}` | e.g. `/ui/MyApp-1.2.3-full.nupkg` | SigV4 with scope credentials | Download object |
 
-### Docker Compose with S3 API enabled
-
-```yaml
-services:
-  releasehost:
-    image: ghcr.io/lakerfield/release-host:latest
-    container_name: lakerfield-releasehost
-    restart: unless-stopped
-    ports:
-      - "80:80"
-    environment:
-      Upload__Token: "change-me"
-      S3__AccessKey: "my-access-key"
-      S3__SecretKey: "my-secret-key"
-    volumes:
-      - ./data:/data/files
-```
+- Unknown bucket/scope → S3 `NoSuchBucket` (404).
+- `GET` requests without S3 auth fall through to the public static file server.
+- When `x-amz-content-sha256` contains a valid 64-character hex SHA-256 hash **and**
+  `Upload:VerifyChecksum` is `true`, the server verifies upload integrity and returns
+  `400 InvalidDigest` on mismatch.
+- Chunked/streaming uploads (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, `UNSIGNED-PAYLOAD`) are
+  accepted; payload hash verification is skipped for those.
 
 ### AWS CLI example
 
 ```bash
-aws s3 cp MyApp-1.2.3-full.nupkg s3://stable/MyApp-1.2.3-full.nupkg \
+aws s3 cp MyApp-1.2.3-full.nupkg s3://ui/MyApp-1.2.3-full.nupkg \
   --endpoint-url http://localhost \
-  --aws-access-key-id my-access-key \
-  --aws-secret-access-key my-secret-key \
+  --aws-access-key-id ui-access-key \
+  --aws-secret-access-key ui-secret-key \
   --region us-east-1
 ```
 
@@ -107,78 +113,120 @@ import boto3
 s3 = boto3.client(
     "s3",
     endpoint_url="http://localhost",
-    aws_access_key_id="my-access-key",
-    aws_secret_access_key="my-secret-key",
+    aws_access_key_id="ui-access-key",
+    aws_secret_access_key="ui-secret-key",
     region_name="us-east-1",
 )
-s3.upload_file("MyApp-1.2.3-full.nupkg", "stable", "MyApp-1.2.3-full.nupkg")
+s3.upload_file("MyApp-1.2.3-full.nupkg", "ui", "MyApp-1.2.3-full.nupkg")
 ```
 
-### S3 API behaviour
+## Root static asset upload (bearer token)
 
-| Operation | Path | Description |
-|---|---|---|
-| `PUT /{bucket}/{*key}` | e.g. `/stable/MyApp-1.2.3-full.nupkg` | Upload object |
-| `HEAD /{bucket}/{*key}` | e.g. `/stable/MyApp-1.2.3-full.nupkg` | Check existence / metadata |
-| `GET /{bucket}/{*key}` | e.g. `/stable/MyApp-1.2.3-full.nupkg` | Download (public, no auth required) |
+Use bearer-token upload for root-level static files: the landing page, CSS, images, etc.
+These are served directly from the files directory.
 
-- The bucket name maps directly to a directory under `Storage:Root`.
-- When `x-amz-content-sha256` contains a valid 64-character hex SHA-256 hash
-  **and** `Upload:VerifyChecksum` is `true`, the server verifies the upload
-  integrity and returns `400 InvalidDigest` on mismatch.
-- Chunked / streaming uploads (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`,
-  `UNSIGNED-PAYLOAD`) are accepted; payload hash verification is skipped for
-  those.
-- `GET` downloads fall through to the existing static-file server and are
-  publicly accessible without authentication.
+> **Note:** Uploading into configured scope directories (e.g. `/ui/...`) is blocked on
+> this endpoint — use the S3 API for release artifacts.
+
+```bash
+# Upload index.html
+curl --fail-with-body -X PUT \
+  -H "Authorization: ******" \
+  -H "Content-Type: text/html" \
+  --data-binary "@index.html" \
+  "https://releases.example.com/index.html"
+
+# Upload a CSS file
+curl --fail-with-body -X PUT \
+  -H "Authorization: ******" \
+  -H "Content-Type: text/css" \
+  --data-binary "@styles/site.css" \
+  "https://releases.example.com/styles/site.css"
+
+# Upload an image
+curl --fail-with-body -X PUT \
+  -H "Authorization: ******" \
+  -H "Content-Type: image/png" \
+  --data-binary "@assets/logo.png" \
+  "https://releases.example.com/assets/logo.png"
+```
 
 ## Configuration
 
 | Setting | Environment variable | Default | Description |
 |---|---|---|---|
-| `Upload:Token` | `Upload__Token` | none | Bearer token required for uploads |
-| `Upload:VerifyChecksum` | `Upload__VerifyChecksum` | `true` | Verifies `X-Checksum-Sha256` when present |
+| `Upload:VerifyChecksum` | `Upload__VerifyChecksum` | `false` | Verifies `X-Checksum-Sha256` / `x-amz-content-sha256` when present |
 | `Upload:RequireChecksum` | `Upload__RequireChecksum` | `false` | Rejects uploads when checksum header is missing |
-| `Storage:Root` | `Storage__Root` | `/data/files` | Root folder used for hosted files |
-| `S3:AccessKey` | `S3__AccessKey` | _(disabled)_ | S3 access key ID — enables S3 API when set together with `S3:SecretKey` |
-| `S3:SecretKey` | `S3__SecretKey` | _(disabled)_ | S3 secret access key — enables S3 API when set together with `S3:AccessKey` |
+| `Storage:Root` | `Storage__Root` | `/data` | Root folder for `config.json`; files are stored under `${Storage:Root}/files/` |
+
+S3 credentials and the root upload key are configured exclusively in `${Storage:Root}/config.json`.
+There are no global S3 environment variables.
 
 ## Routing
 
 ```text
-/                   -> /data/files/index.html
-/stable/...         -> /data/files/stable/...
-/dev/...            -> /data/files/dev/...
-/upload/index.html  -> upload to /data/files/index.html
-/upload/stable/...  -> upload to /data/files/stable/...
-/upload/dev/...     -> upload to /data/files/dev/...
+/                         -> /data/files/index.html  (or 404)
+/ui/...                   -> /data/files/ui/...       (public static files)
+/service/...              -> /data/files/service/...  (public static files)
+PUT /index.html           -> upload to /data/files/index.html        (bearer auth)
+PUT /styles/site.css      -> upload to /data/files/styles/site.css   (bearer auth)
+PUT /assets/logo.png      -> upload to /data/files/assets/logo.png   (bearer auth)
+PUT /ui/{*key}            -> upload to /data/files/ui/{key}          (S3 SigV4 auth)
+PUT /service/{*key}       -> upload to /data/files/service/{key}     (S3 SigV4 auth)
 ```
 
 ## Storage layout
 
 ```text
-/data/files/
-  index.html
-  stable/
-    releases.stable.json
-    MyApp-1.2.3-full.nupkg
-  dev/
-    releases.dev.json
-    MyApp-1.3.0-dev.1-full.nupkg
+/data/
+  config.json           <- credentials / scope config (never served publicly)
+  files/
+    index.html          <- root landing page
+    styles/
+      site.css
+    assets/
+      logo.png
+    ui/
+      releases.stable.json
+      MyApp-1.2.3-full.nupkg
+    service/
+      releases.stable.json
+      MyApp-1.2.3-full.nupkg
 ```
 
 ## Velopack
 
-One ReleaseHost instance per application, channels separated by path:
+Multiple product components on one release host, each using its own S3 bucket:
 
 ```text
-https://releases.example.com/stable/releases.stable.json
-https://releases.example.com/dev/releases.dev.json
+https://releases.example.com/ui/releases.stable.json
+https://releases.example.com/service/releases.stable.json
+```
+
+Configure Velopack (or your CI pipeline) to use the S3 endpoint per component:
+
+```bash
+# UI component
+vpk upload s3 \
+  --bucket ui \
+  --endpoint http://releases.example.com \
+  --keyId ui-access-key \
+  --secret ui-secret-key \
+  --region us-east-1
+
+# Service component
+vpk upload s3 \
+  --bucket service \
+  --endpoint http://releases.example.com \
+  --keyId service-access-key \
+  --secret service-secret-key \
+  --region us-east-1
 ```
 
 ## Security
 
 - Use HTTPS in front of the service
-- Store files on a mounted volume
-- Inject the upload token and S3 keys through secrets management
-- Prefer checksum verification in CI
+- Store the mounted volume securely — `config.json` contains all upload credentials
+- Inject secrets via secrets management (e.g. Kubernetes Secret mounted as a file)
+- Unknown S3 buckets return `NoSuchBucket` (404) — only configured scopes are accessible
+- Bearer-token uploads are confined to root/static assets; scope directories are protected

@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using Microsoft.Extensions.FileProviders;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -10,25 +11,22 @@ builder.WebHost.ConfigureKestrel(options =>
   options.Limits.MaxRequestBodySize = 100 * 1024 * 1024; // 100 MB
 });
 
+var storageRoot = builder.Configuration["Storage:Root"] ?? "/data";
 var settings = new FileServerSettings
 {
-  UploadToken = builder.Configuration["Upload:Token"] ?? throw new InvalidOperationException("Upload:Token missing"),
-  StorageRoot = builder.Configuration["Storage:Root"] ?? "/data/files",
+  StorageRoot = storageRoot,
+  FilesRoot = Path.Combine(storageRoot, "files"),
   RequireChecksum = bool.TryParse(builder.Configuration["Upload:RequireChecksum"], out var requireChecksum) && requireChecksum,
-  VerifyChecksum = !bool.TryParse(builder.Configuration["Upload:VerifyChecksum"], out var verifyChecksum) || verifyChecksum
+  VerifyChecksum = bool.TryParse(builder.Configuration["Upload:VerifyChecksum"], out var verifyChecksum) && verifyChecksum
 };
-
-S3Settings? s3Settings = null;
-var s3AccessKey = builder.Configuration["S3:AccessKey"];
-var s3SecretKey = builder.Configuration["S3:SecretKey"];
-if (!string.IsNullOrEmpty(s3AccessKey) && !string.IsNullOrEmpty(s3SecretKey))
-  s3Settings = new S3Settings { AccessKey = s3AccessKey, SecretKey = s3SecretKey };
 
 var app = builder.Build();
 
-Directory.CreateDirectory(settings.StorageRoot);
+Directory.CreateDirectory(settings.FilesRoot);
 
-// S3-compatible API middleware — intercepts PUT/HEAD requests that carry AWS Signature V4 auth.
+var storageConfig = LoadStorageConfig(settings.StorageRoot);
+
+// S3-compatible API middleware — intercepts GET/PUT/HEAD requests that carry AWS Signature V4 auth.
 app.Use(async (context, next) =>
 {
   var authHeader = context.Request.Headers.Authorization.ToString();
@@ -39,22 +37,19 @@ app.Use(async (context, next) =>
        context.Request.Method == HttpMethods.Put ||
        context.Request.Method == HttpMethods.Head))
   {
-    if (s3Settings is null)
-    {
-      await WriteS3ErrorAsync(context, 403, "AccessDenied", "S3 API is not configured on this server");
-      return;
-    }
-
-    await HandleS3RequestAsync(context, s3Settings, settings, context.RequestAborted);
+    await HandleS3RequestAsync(context, storageConfig, settings, context.RequestAborted);
     return;
   }
 
   await next();
 });
 
+// Bearer-token auth middleware — handles PUT requests not already processed by the S3
+// middleware above. S3 PUTs (AWS4-HMAC-SHA256 auth) are short-circuited by the first
+// middleware and never reach here.
 app.Use(async (context, next) =>
 {
-  if (context.Request.Path.StartsWithSegments("/upload"))
+  if (context.Request.Method == HttpMethods.Put)
   {
     var authHeader = context.Request.Headers.Authorization.ToString();
     if (!authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
@@ -65,7 +60,8 @@ app.Use(async (context, next) =>
     }
 
     var providedToken = authHeader["Bearer ".Length..].Trim();
-    if ((!SecureEquals(providedToken, settings.UploadToken)) || SecureEquals(providedToken, "super-secret-token"))
+    var rootKey = storageConfig.RootUploadKey;
+    if (string.IsNullOrWhiteSpace(rootKey) || !SecureEquals(providedToken, rootKey))
     {
       context.Response.StatusCode = StatusCodes.Status403Forbidden;
       await context.Response.WriteAsync("Invalid bearer token");
@@ -76,7 +72,7 @@ app.Use(async (context, next) =>
   await next();
 });
 
-app.MapPut("/upload/{*relativePath}", async (
+app.MapPut("/{*relativePath}", async (
     HttpRequest request,
     string relativePath,
     CancellationToken cancellationToken) =>
@@ -86,10 +82,16 @@ app.MapPut("/upload/{*relativePath}", async (
   if (string.IsNullOrWhiteSpace(relativePath))
     return Results.BadRequest("Invalid upload path");
 
-  var targetPath = Path.Combine(settings.StorageRoot, relativePath);
-  var fullStorageRoot = Path.GetFullPath(settings.StorageRoot);
+  // Block uploads into configured scope (bucket) directories — those are S3-only.
+  var firstSegment = relativePath.Split('/')[0];
+  if (!string.IsNullOrEmpty(firstSegment) &&
+      storageConfig.Scopes.Keys.Any(k => string.Equals(k, firstSegment, StringComparison.OrdinalIgnoreCase)))
+    return Results.NotFound();
+
+  var targetPath = Path.Combine(settings.FilesRoot, relativePath);
+  var fullFilesRoot = Path.GetFullPath(settings.FilesRoot);
   var fullTargetPath = Path.GetFullPath(targetPath);
-  if (!fullTargetPath.StartsWith(fullStorageRoot, StringComparison.Ordinal))
+  if (!fullTargetPath.StartsWith(fullFilesRoot, StringComparison.Ordinal))
     return Results.BadRequest("Invalid upload path");
 
   var fileName = Path.GetFileName(fullTargetPath);
@@ -114,17 +116,17 @@ app.MapGet("/health", () => Results.Ok(new
   status = "ok",
   checksumVerification = settings.VerifyChecksum,
   checksumRequired = settings.RequireChecksum,
-  s3Compatible = s3Settings is not null
+  configuredScopes = storageConfig.Scopes.Keys.ToArray()
 }));
 
 app.UseDefaultFiles(new DefaultFilesOptions
 {
-  FileProvider = new PhysicalFileProvider(settings.StorageRoot)
+  FileProvider = new PhysicalFileProvider(settings.FilesRoot)
 });
 
 app.UseStaticFiles(new StaticFileOptions
 {
-  FileProvider = new PhysicalFileProvider(settings.StorageRoot),
+  FileProvider = new PhysicalFileProvider(settings.FilesRoot),
   RequestPath = "",
   ServeUnknownFileTypes = true,
   DefaultContentType = "application/octet-stream",
@@ -136,6 +138,33 @@ app.UseStaticFiles(new StaticFileOptions
 });
 
 app.Run();
+
+static StorageConfig LoadStorageConfig(string storageRoot)
+{
+  var configPath = Path.Combine(storageRoot, "config.json");
+  if (!File.Exists(configPath))
+    return new StorageConfig();
+  try
+  {
+    var json = File.ReadAllText(configPath);
+    return JsonSerializer.Deserialize<StorageConfig>(json,
+        new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+        ?? new StorageConfig();
+  }
+  catch (Exception ex)
+  {
+    Console.Error.WriteLine($"[ReleaseHost] Failed to load storage config from '{configPath}': {ex.Message}");
+    return new StorageConfig();
+  }
+}
+
+static string ExtractBucketFromPath(string path)
+{
+  var trimmed = path.TrimStart('/');
+  var slashIdx = trimmed.IndexOf('/');
+  if (slashIdx > 0) return trimmed[..slashIdx];
+  return trimmed.Length > 0 ? trimmed : string.Empty;
+}
 
 static async Task<FileSaveResult> SaveRequestBodyToFileAsync(
     HttpRequest request,
@@ -299,15 +328,30 @@ static void TryDelete(string path)
 
 static async Task HandleS3RequestAsync(
     HttpContext context,
-    S3Settings s3Settings,
+    StorageConfig storageConfig,
     FileServerSettings settings,
     CancellationToken cancellationToken)
 {
+  var path = context.Request.Path.Value ?? "/";
+
+  // Resolve the bucket/scope from the request path: /{bucket}/{*key}
+  var bucket = ExtractBucketFromPath(path);
+  var scopeKey = storageConfig.Scopes.Keys
+      .FirstOrDefault(k => string.Equals(k, bucket, StringComparison.OrdinalIgnoreCase));
+
+  if (scopeKey is null)
+  {
+    await WriteS3ErrorAsync(context, 404, "NoSuchBucket", "The specified bucket does not exist");
+    return;
+  }
+
+  var scopeConfig = storageConfig.Scopes[scopeKey];
+
   var authHeader = context.Request.Headers.Authorization.ToString();
   var (accessKeyId, date, region, service, signedHeaderNames, signature) =
       ParseAwsAuthHeader(authHeader);
 
-  if (!SecureEquals(accessKeyId, s3Settings.AccessKey))
+  if (!SecureEquals(accessKeyId, scopeConfig.S3AccessKey))
   {
     await WriteS3ErrorAsync(context, 403, "InvalidAccessKeyId",
         "The AWS Access Key Id provided does not exist in our records");
@@ -324,7 +368,7 @@ static async Task HandleS3RequestAsync(
   }
 
   var expectedSig = ComputeAwsV4Signature(
-      context.Request, s3Settings.SecretKey, date, region, service, signedHeaderNames);
+      context.Request, scopeConfig.S3SecretKey, date, region, service, signedHeaderNames);
 
   if (!SecureEquals(signature, expectedSig))
   {
@@ -332,8 +376,6 @@ static async Task HandleS3RequestAsync(
         "The request signature we calculated does not match the signature you provided");
     return;
   }
-
-  var path = context.Request.Path.Value ?? "/";
 
   if (context.Request.Method == HttpMethods.Get)
     await HandleS3GetObjectAsync(context, path, settings, cancellationToken);
@@ -356,10 +398,10 @@ static async Task HandleS3PutObjectAsync(
     return;
   }
 
-  var targetPath = Path.Combine(settings.StorageRoot, relativePath);
-  var fullStorageRoot = Path.GetFullPath(settings.StorageRoot);
+  var targetPath = Path.Combine(settings.FilesRoot, relativePath);
+  var fullFilesRoot = Path.GetFullPath(settings.FilesRoot);
   var fullTargetPath = Path.GetFullPath(targetPath);
-  if (!fullTargetPath.StartsWith(fullStorageRoot, StringComparison.Ordinal))
+  if (!fullTargetPath.StartsWith(fullFilesRoot, StringComparison.Ordinal))
   {
     await WriteS3ErrorAsync(context, 400, "InvalidArgument", "Invalid object key");
     return;
@@ -387,8 +429,8 @@ static async Task HandleS3PutObjectAsync(
 
   var s3ChecksumSettings = new FileServerSettings
   {
-    UploadToken = settings.UploadToken,
     StorageRoot = settings.StorageRoot,
+    FilesRoot = settings.FilesRoot,
     VerifyChecksum = hasPayloadHash && settings.VerifyChecksum,
     RequireChecksum = false
   };
@@ -438,10 +480,10 @@ static async Task HandleS3GetObjectAsync(
     return;
   }
 
-  var targetPath = Path.Combine(settings.StorageRoot, relativePath);
-  var fullStorageRoot = Path.GetFullPath(settings.StorageRoot);
+  var targetPath = Path.Combine(settings.FilesRoot, relativePath);
+  var fullFilesRoot = Path.GetFullPath(settings.FilesRoot);
   var fullTargetPath = Path.GetFullPath(targetPath);
-  if (!fullTargetPath.StartsWith(fullStorageRoot, StringComparison.Ordinal))
+  if (!fullTargetPath.StartsWith(fullFilesRoot, StringComparison.Ordinal))
   {
     await WriteS3ErrorAsync(context, 404, "NoSuchKey", "The specified key does not exist");
     return;
@@ -494,10 +536,10 @@ static async Task HandleS3HeadObjectAsync(
     return;
   }
 
-  var targetPath = Path.Combine(settings.StorageRoot, relativePath);
-  var fullStorageRoot = Path.GetFullPath(settings.StorageRoot);
+  var targetPath = Path.Combine(settings.FilesRoot, relativePath);
+  var fullFilesRoot = Path.GetFullPath(settings.FilesRoot);
   var fullTargetPath = Path.GetFullPath(targetPath);
-  if (!fullTargetPath.StartsWith(fullStorageRoot, StringComparison.Ordinal))
+  if (!fullTargetPath.StartsWith(fullFilesRoot, StringComparison.Ordinal))
   {
     context.Response.StatusCode = 404;
     return;
@@ -693,8 +735,8 @@ static string XmlEncode(string value) =>
 
 public sealed class FileServerSettings
 {
-  public required string UploadToken { get; init; }
   public required string StorageRoot { get; init; }
+  public required string FilesRoot { get; init; }
   public bool VerifyChecksum { get; init; }
   public bool RequireChecksum { get; init; }
 }
@@ -767,10 +809,16 @@ public sealed class FileSaveResult
   }
 }
 
-public sealed class S3Settings
+public sealed class StorageConfig
 {
-  public required string AccessKey { get; init; }
-  public required string SecretKey { get; init; }
+  public string RootUploadKey { get; init; } = string.Empty;
+  public Dictionary<string, ScopeConfig> Scopes { get; init; } = new();
+}
+
+public sealed class ScopeConfig
+{
+  public required string S3AccessKey { get; init; }
+  public required string S3SecretKey { get; init; }
 }
 
 // Decodes the AWS chunked transfer encoding used when x-amz-content-sha256 is
