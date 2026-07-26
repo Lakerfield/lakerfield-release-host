@@ -44,6 +44,9 @@ app.Use(async (context, next) =>
   await next();
 });
 
+// Bearer-token auth middleware — handles PUT requests not already processed by the S3
+// middleware above. S3 PUTs (AWS4-HMAC-SHA256 auth) are short-circuited by the first
+// middleware and never reach here.
 app.Use(async (context, next) =>
 {
   if (context.Request.Method == HttpMethods.Put)
