@@ -18,19 +18,20 @@ No database or cloud storage required.
 docker run -d \
   --name lakerfield-releasehost \
   -p 80:80 \
-  -v ./data:/data/files \
+  -v ./data:/data \
   ghcr.io/lakerfield/release-host:latest
 ```
 
-- `http://localhost/` — root page (`index.html` from storage root, or 404)
+- `http://localhost/` — root page (`index.html` from files directory, or 404)
 - `http://localhost/{bucket}/{*key}` — S3-compatible upload / download endpoint
-- `http://localhost/upload/{*relativePath}` — bearer-token upload for root static assets
+- `http://localhost/{*relativePath}` — bearer-token PUT for root static assets
 - `http://localhost/health` — health check (reports configured scopes)
 
 ## Storage config (`config.json`)
 
-Create `config.json` at the root of the mounted storage volume (e.g. `/data/files/config.json`).
+Create `config.json` at the root of the mounted storage volume (e.g. `/data/config.json`).
 The file is loaded at startup and controls all upload credentials.
+It is stored outside the files-serving directory (`/data/files/`) and is never served publicly.
 
 ```json
 {
@@ -67,7 +68,7 @@ services:
     ports:
       - "80:80"
     volumes:
-      - ./data:/data/files
+      - ./data:/data
 ```
 
 Then place your `config.json` in `./data/config.json` before starting the container.
@@ -122,9 +123,9 @@ s3.upload_file("MyApp-1.2.3-full.nupkg", "ui", "MyApp-1.2.3-full.nupkg")
 ## Root static asset upload (bearer token)
 
 Use bearer-token upload for root-level static files: the landing page, CSS, images, etc.
-These are served directly from the storage root.
+These are served directly from the files directory.
 
-> **Note:** Uploading into configured scope directories (e.g. `/upload/ui/...`) is blocked on
+> **Note:** Uploading into configured scope directories (e.g. `/ui/...`) is blocked on
 > this endpoint — use the S3 API for release artifacts.
 
 ```bash
@@ -133,21 +134,21 @@ curl --fail-with-body -X PUT \
   -H "Authorization: ******" \
   -H "Content-Type: text/html" \
   --data-binary "@index.html" \
-  "https://releases.example.com/upload/index.html"
+  "https://releases.example.com/index.html"
 
 # Upload a CSS file
 curl --fail-with-body -X PUT \
   -H "Authorization: ******" \
   -H "Content-Type: text/css" \
   --data-binary "@styles/site.css" \
-  "https://releases.example.com/upload/styles/site.css"
+  "https://releases.example.com/styles/site.css"
 
 # Upload an image
 curl --fail-with-body -X PUT \
   -H "Authorization: ******" \
   -H "Content-Type: image/png" \
   --data-binary "@assets/logo.png" \
-  "https://releases.example.com/upload/assets/logo.png"
+  "https://releases.example.com/assets/logo.png"
 ```
 
 ## Configuration
@@ -156,7 +157,7 @@ curl --fail-with-body -X PUT \
 |---|---|---|---|
 | `Upload:VerifyChecksum` | `Upload__VerifyChecksum` | `false` | Verifies `X-Checksum-Sha256` / `x-amz-content-sha256` when present |
 | `Upload:RequireChecksum` | `Upload__RequireChecksum` | `false` | Rejects uploads when checksum header is missing |
-| `Storage:Root` | `Storage__Root` | `/data/files` | Root folder used for hosted files and `config.json` |
+| `Storage:Root` | `Storage__Root` | `/data` | Root folder for `config.json`; files are stored under `${Storage:Root}/files/` |
 
 S3 credentials and the root upload key are configured exclusively in `${Storage:Root}/config.json`.
 There are no global S3 environment variables.
@@ -167,9 +168,9 @@ There are no global S3 environment variables.
 /                         -> /data/files/index.html  (or 404)
 /ui/...                   -> /data/files/ui/...       (public static files)
 /service/...              -> /data/files/service/...  (public static files)
-/upload/index.html        -> upload to /data/files/index.html        (bearer auth)
-/upload/styles/site.css   -> upload to /data/files/styles/site.css   (bearer auth)
-/upload/assets/logo.png   -> upload to /data/files/assets/logo.png   (bearer auth)
+PUT /index.html           -> upload to /data/files/index.html        (bearer auth)
+PUT /styles/site.css      -> upload to /data/files/styles/site.css   (bearer auth)
+PUT /assets/logo.png      -> upload to /data/files/assets/logo.png   (bearer auth)
 PUT /ui/{*key}            -> upload to /data/files/ui/{key}          (S3 SigV4 auth)
 PUT /service/{*key}       -> upload to /data/files/service/{key}     (S3 SigV4 auth)
 ```
@@ -177,19 +178,20 @@ PUT /service/{*key}       -> upload to /data/files/service/{key}     (S3 SigV4 a
 ## Storage layout
 
 ```text
-/data/files/
-  config.json           <- credentials / scope config (not served publicly)
-  index.html            <- root landing page
-  styles/
-    site.css
-  assets/
-    logo.png
-  ui/
-    releases.stable.json
-    MyApp-1.2.3-full.nupkg
-  service/
-    releases.stable.json
-    MyApp-1.2.3-full.nupkg
+/data/
+  config.json           <- credentials / scope config (never served publicly)
+  files/
+    index.html          <- root landing page
+    styles/
+      site.css
+    assets/
+      logo.png
+    ui/
+      releases.stable.json
+      MyApp-1.2.3-full.nupkg
+    service/
+      releases.stable.json
+      MyApp-1.2.3-full.nupkg
 ```
 
 ## Velopack

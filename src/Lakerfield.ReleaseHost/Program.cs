@@ -11,16 +11,18 @@ builder.WebHost.ConfigureKestrel(options =>
   options.Limits.MaxRequestBodySize = 100 * 1024 * 1024; // 100 MB
 });
 
+var storageRoot = builder.Configuration["Storage:Root"] ?? "/data";
 var settings = new FileServerSettings
 {
-  StorageRoot = builder.Configuration["Storage:Root"] ?? "/data/files",
+  StorageRoot = storageRoot,
+  FilesRoot = Path.Combine(storageRoot, "files"),
   RequireChecksum = bool.TryParse(builder.Configuration["Upload:RequireChecksum"], out var requireChecksum) && requireChecksum,
   VerifyChecksum = bool.TryParse(builder.Configuration["Upload:VerifyChecksum"], out var verifyChecksum) && verifyChecksum
 };
 
 var app = builder.Build();
 
-Directory.CreateDirectory(settings.StorageRoot);
+Directory.CreateDirectory(settings.FilesRoot);
 
 var storageConfig = LoadStorageConfig(settings.StorageRoot);
 
@@ -44,7 +46,7 @@ app.Use(async (context, next) =>
 
 app.Use(async (context, next) =>
 {
-  if (context.Request.Path.StartsWithSegments("/upload"))
+  if (context.Request.Method == HttpMethods.Put)
   {
     var authHeader = context.Request.Headers.Authorization.ToString();
     if (!authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
@@ -67,7 +69,7 @@ app.Use(async (context, next) =>
   await next();
 });
 
-app.MapPut("/upload/{*relativePath}", async (
+app.MapPut("/{*relativePath}", async (
     HttpRequest request,
     string relativePath,
     CancellationToken cancellationToken) =>
@@ -83,10 +85,10 @@ app.MapPut("/upload/{*relativePath}", async (
       storageConfig.Scopes.Keys.Any(k => string.Equals(k, firstSegment, StringComparison.OrdinalIgnoreCase)))
     return Results.NotFound();
 
-  var targetPath = Path.Combine(settings.StorageRoot, relativePath);
-  var fullStorageRoot = Path.GetFullPath(settings.StorageRoot);
+  var targetPath = Path.Combine(settings.FilesRoot, relativePath);
+  var fullFilesRoot = Path.GetFullPath(settings.FilesRoot);
   var fullTargetPath = Path.GetFullPath(targetPath);
-  if (!fullTargetPath.StartsWith(fullStorageRoot, StringComparison.Ordinal))
+  if (!fullTargetPath.StartsWith(fullFilesRoot, StringComparison.Ordinal))
     return Results.BadRequest("Invalid upload path");
 
   var fileName = Path.GetFileName(fullTargetPath);
@@ -116,12 +118,12 @@ app.MapGet("/health", () => Results.Ok(new
 
 app.UseDefaultFiles(new DefaultFilesOptions
 {
-  FileProvider = new PhysicalFileProvider(settings.StorageRoot)
+  FileProvider = new PhysicalFileProvider(settings.FilesRoot)
 });
 
 app.UseStaticFiles(new StaticFileOptions
 {
-  FileProvider = new PhysicalFileProvider(settings.StorageRoot),
+  FileProvider = new PhysicalFileProvider(settings.FilesRoot),
   RequestPath = "",
   ServeUnknownFileTypes = true,
   DefaultContentType = "application/octet-stream",
@@ -393,10 +395,10 @@ static async Task HandleS3PutObjectAsync(
     return;
   }
 
-  var targetPath = Path.Combine(settings.StorageRoot, relativePath);
-  var fullStorageRoot = Path.GetFullPath(settings.StorageRoot);
+  var targetPath = Path.Combine(settings.FilesRoot, relativePath);
+  var fullFilesRoot = Path.GetFullPath(settings.FilesRoot);
   var fullTargetPath = Path.GetFullPath(targetPath);
-  if (!fullTargetPath.StartsWith(fullStorageRoot, StringComparison.Ordinal))
+  if (!fullTargetPath.StartsWith(fullFilesRoot, StringComparison.Ordinal))
   {
     await WriteS3ErrorAsync(context, 400, "InvalidArgument", "Invalid object key");
     return;
@@ -425,6 +427,7 @@ static async Task HandleS3PutObjectAsync(
   var s3ChecksumSettings = new FileServerSettings
   {
     StorageRoot = settings.StorageRoot,
+    FilesRoot = settings.FilesRoot,
     VerifyChecksum = hasPayloadHash && settings.VerifyChecksum,
     RequireChecksum = false
   };
@@ -474,10 +477,10 @@ static async Task HandleS3GetObjectAsync(
     return;
   }
 
-  var targetPath = Path.Combine(settings.StorageRoot, relativePath);
-  var fullStorageRoot = Path.GetFullPath(settings.StorageRoot);
+  var targetPath = Path.Combine(settings.FilesRoot, relativePath);
+  var fullFilesRoot = Path.GetFullPath(settings.FilesRoot);
   var fullTargetPath = Path.GetFullPath(targetPath);
-  if (!fullTargetPath.StartsWith(fullStorageRoot, StringComparison.Ordinal))
+  if (!fullTargetPath.StartsWith(fullFilesRoot, StringComparison.Ordinal))
   {
     await WriteS3ErrorAsync(context, 404, "NoSuchKey", "The specified key does not exist");
     return;
@@ -530,10 +533,10 @@ static async Task HandleS3HeadObjectAsync(
     return;
   }
 
-  var targetPath = Path.Combine(settings.StorageRoot, relativePath);
-  var fullStorageRoot = Path.GetFullPath(settings.StorageRoot);
+  var targetPath = Path.Combine(settings.FilesRoot, relativePath);
+  var fullFilesRoot = Path.GetFullPath(settings.FilesRoot);
   var fullTargetPath = Path.GetFullPath(targetPath);
-  if (!fullTargetPath.StartsWith(fullStorageRoot, StringComparison.Ordinal))
+  if (!fullTargetPath.StartsWith(fullFilesRoot, StringComparison.Ordinal))
   {
     context.Response.StatusCode = 404;
     return;
@@ -730,6 +733,7 @@ static string XmlEncode(string value) =>
 public sealed class FileServerSettings
 {
   public required string StorageRoot { get; init; }
+  public required string FilesRoot { get; init; }
   public bool VerifyChecksum { get; init; }
   public bool RequireChecksum { get; init; }
 }
