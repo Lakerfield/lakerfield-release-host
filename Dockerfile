@@ -6,7 +6,7 @@
 # https://github.com/dotnet/dotnet-docker/blob/main/README.aspnet.md#full-tag-listing
 # 10.0.14-alpine3.24
 
-FROM mcr.microsoft.com/dotnet/sdk:10.0.403-alpine3.24 AS build
+FROM mcr.microsoft.com/dotnet/sdk:11.0.100-alpine3.24 AS build
 WORKDIR /src
 COPY ./src/Lakerfield.ReleaseHost/ .
 RUN dotnet publish -c Release -o /out
